@@ -19,6 +19,12 @@ const DIRECTLY_VIEWABLE_FORMATS = ['tif', 'tiff', 'svs'];
 // ========================================
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Verify GeoTIFFTileSource library is loaded
+    if (typeof OpenSeadragon !== 'undefined' && typeof OpenSeadragon.GeoTIFFTileSource === 'undefined') {
+        console.warn('GeoTIFFTileSource plugin not found. Direct viewing of GeoTIFF files may not work.');
+        console.warn('Make sure geotiff-tilesource library is loaded before viewer.js');
+    }
+    
     initializeEventListeners();
     loadSlides();
 });
@@ -402,33 +408,65 @@ async function loadInViewer(sourceUrl, type) {
     // If GeoTIFF, create the specific tile source
     if (type === 'geotiff') {
         try {
-            console.log('Attempting to load GeoTIFF from:', sourceUrl);
+            // Ensure URL is absolute
+            let absoluteUrl = sourceUrl;
+            if (!sourceUrl.startsWith('http')) {
+                // Convert relative URL to absolute
+                absoluteUrl = new URL(sourceUrl, window.location.origin).href;
+            }
             
-            // Check if URL is accessible first (for debugging)
-            if (sourceUrl.startsWith('http')) {
-                try {
-                    const headResponse = await fetch(sourceUrl, { method: 'HEAD', mode: 'no-cors' });
-                    console.log('URL accessibility check completed');
-                } catch (headError) {
-                    console.warn('URL HEAD check failed (this is OK for CORS):', headError);
-                }
+            console.log('Attempting to load GeoTIFF from:', absoluteUrl);
+            console.log('OpenSeadragon available:', typeof OpenSeadragon !== 'undefined');
+            console.log('GeoTIFFTileSource available:', typeof OpenSeadragon.GeoTIFFTileSource !== 'undefined');
+            
+            // Verify GeoTIFFTileSource is available
+            if (!OpenSeadragon.GeoTIFFTileSource) {
+                throw new Error('GeoTIFFTileSource plugin not loaded. Check that geotiff-tilesource library is included.');
+            }
+            
+            // Test URL accessibility first
+            try {
+                const testResponse = await fetch(absoluteUrl, { 
+                    method: 'HEAD',
+                    headers: {
+                        'Range': 'bytes=0-1023'
+                    }
+                });
+                console.log('URL test response status:', testResponse.status);
+                console.log('URL test response headers:', Object.fromEntries(testResponse.headers.entries()));
+            } catch (testError) {
+                console.warn('URL accessibility test failed (may be OK):', testError);
             }
             
             // Use getAllTileSources static method as per documentation
             // Supports both local files (File object) and remote URLs (string)
-            tileSources = await OpenSeadragon.GeoTIFFTileSource.getAllTileSources(sourceUrl, {
-                logLatency: false,
-                // Add additional options for remote URLs
-                ...(sourceUrl.startsWith('http') && {
-                    // For remote URLs, ensure CORS is handled
-                    headers: {}
-                })
-            });
+            const options = {
+                logLatency: true,  // Enable logging for debugging
+                // Enable range requests for better performance
+                useRangeRequests: true
+            };
+            
+            // Add CORS-related options for HTTP URLs
+            if (absoluteUrl.startsWith('http')) {
+                options.headers = {
+                    'Accept': 'image/tiff,image/*,*/*'
+                };
+            }
+            
+            console.log('Calling GeoTIFFTileSource.getAllTileSources with options:', options);
+            tileSources = await OpenSeadragon.GeoTIFFTileSource.getAllTileSources(absoluteUrl, options);
             
             console.log('GeoTIFFTileSource created successfully, tile sources:', tileSources);
+            
+            // Validate tile sources
+            if (!tileSources || (Array.isArray(tileSources) && tileSources.length === 0)) {
+                throw new Error('GeoTIFFTileSource returned empty or invalid tile sources');
+            }
         } catch (e) {
             console.error('Failed to create GeoTIFFTileSource:', e);
-            console.error('Error details:', e.message, e.stack);
+            console.error('Error name:', e.name);
+            console.error('Error message:', e.message);
+            console.error('Error stack:', e.stack);
             
             // Check if it's a GCS file
             const isGCSFile = sourceUrl.includes('storage.googleapis.com') || sourceUrl.includes('storage.cloud.google.com');
@@ -436,7 +474,8 @@ async function loadInViewer(sourceUrl, type) {
             if (isGCSFile) {
                 showToast(`Failed to load GCS file: ${e.message}. The file may require CORS configuration or the signed URL may have expired.`, 'error');
             } else {
-                showToast('Direct viewing failed, falling back to DZI...', 'warning');
+                console.warn('GeoTIFF direct viewing failed, attempting fallback to DZI...');
+                showToast('Direct viewing failed, falling back to converted tiles...', 'warning');
                 loadDziFallback();
             }
             return;

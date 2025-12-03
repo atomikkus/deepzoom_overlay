@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 from datetime import datetime, timedelta
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,8 +109,114 @@ async def serve_js():
     return FileResponse('viewer.js', media_type='application/javascript')
 
 
-# Mount uploads folder for direct access (needed for GeoTIFFTileSource)
-app.mount("/api/raw_slides", StaticFiles(directory=UPLOAD_FOLDER), name="raw_slides")
+@app.options("/api/raw_slides/{filename:path}")
+async def options_raw_slide(filename: str):
+    """Handle CORS preflight requests for raw slide files"""
+    from fastapi.responses import Response
+    return Response(
+        status_code=200,
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'Range, Content-Type, Accept',
+            'Access-Control-Expose-Headers': 'Content-Length, Content-Type, Content-Range, Accept-Ranges',
+            'Access-Control-Max-Age': '3600'
+        }
+    )
+
+
+@app.get("/api/raw_slides/{filename:path}")
+async def serve_raw_slide(filename: str, request: Request):
+    """Serve raw slide files with proper CORS headers and range request support for GeoTIFFTileSource"""
+    from fastapi.responses import Response
+    
+    try:
+        file_path = Path(UPLOAD_FOLDER) / filename
+        
+        # Security check: ensure file is within upload folder
+        try:
+            if not file_path.resolve().is_relative_to(Path(UPLOAD_FOLDER).resolve()):
+                raise HTTPException(status_code=403, detail="Access denied")
+        except AttributeError:
+            # Python < 3.9 compatibility
+            try:
+                file_path.resolve().relative_to(Path(UPLOAD_FOLDER).resolve())
+            except ValueError:
+                raise HTTPException(status_code=403, detail="Access denied")
+        
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Determine content type based on extension
+        ext = filename.rsplit('.', 1)[-1].lower()
+        content_type_map = {
+            'svs': 'image/tiff',
+            'tif': 'image/tiff',
+            'tiff': 'image/tiff',
+            'vms': 'application/octet-stream',
+            'vmu': 'application/octet-stream',
+            'ndpi': 'application/octet-stream',
+            'scn': 'application/octet-stream',
+            'mrxs': 'application/octet-stream',
+            'svslide': 'application/octet-stream',
+            'bif': 'application/octet-stream'
+        }
+        content_type = content_type_map.get(ext, 'application/octet-stream')
+        
+        file_size = file_path.stat().st_size
+        
+        # Handle range requests (required for GeoTIFFTileSource)
+        range_header = request.headers.get('range')
+        
+        cors_headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'Range, Content-Type, Accept',
+            'Access-Control-Expose-Headers': 'Content-Length, Content-Type, Content-Range, Accept-Ranges',
+            'Accept-Ranges': 'bytes',
+            'Content-Type': content_type
+        }
+        
+        if range_header:
+            # Parse range header
+            range_match = range_header.replace('bytes=', '').split('-')
+            start = int(range_match[0]) if range_match[0] else 0
+            end = int(range_match[1]) if range_match[1] and range_match[1] else file_size - 1
+            
+            # Ensure valid range
+            if start >= file_size or end >= file_size or start > end:
+                return Response(
+                    status_code=416,  # Range Not Satisfiable
+                    headers={**cors_headers, 'Content-Range': f'bytes */{file_size}'}
+                )
+            
+            # Read the requested range
+            with open(file_path, 'rb') as f:
+                f.seek(start)
+                content = f.read(end - start + 1)
+            
+            return Response(
+                content=content,
+                status_code=206,  # Partial Content
+                headers={
+                    **cors_headers,
+                    'Content-Length': str(len(content)),
+                    'Content-Range': f'bytes {start}-{end}/{file_size}'
+                }
+            )
+        else:
+            # Full file request
+            from fastapi.responses import FileResponse
+            return FileResponse(
+                path=str(file_path),
+                media_type=content_type,
+                headers=cors_headers
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to serve file: {str(e)}")
 
 # Add CORS headers for GCS proxy endpoint
 @app.post("/api/gcs/download")
@@ -592,8 +698,8 @@ async def startup_event():
     print("=" * 60)
     print("WSI DeepZoom Viewer Server (FastAPI)")
     print("=" * 60)
-    print(f"Server running on http://localhost:8000")
-    print(f"API docs available at http://localhost:8000/docs")
+    print(f"Server running on http://localhost:8009")
+    print(f"API docs available at http://localhost:8009/docs")
     print(f"Upload folder: {UPLOAD_FOLDER}")
     print(f"Cache folder: {CACHE_FOLDER}")
     print(f"Supported formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
@@ -601,5 +707,5 @@ async def startup_event():
 
 
 # ========================================
-# Run with: uvicorn app:app --reload --port 8000
+# Run with: uvicorn app:app --reload --port 8009
 # ========================================
